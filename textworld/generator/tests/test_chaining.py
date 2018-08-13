@@ -276,3 +276,30 @@ def test_backward_chaining():
     for chain in chains:
         for depth, action in enumerate(chain):
             assert action.action.name in [rule.name for rule in rules_per_depth[depth]]
+
+
+from textworld.logic import GameLogic
+from textworld.generator.chaining import chain
+
+def test_parallel_quests():
+    logic = GameLogic.parse("""
+        type foo {
+            rules {
+                do_a :: not_a(foo) & $not_c(foo) -> a(foo);
+                do_b :: not_b(foo) & $not_c(foo) -> b(foo);
+                do_c :: $a(foo) & $b(foo) & not_c(foo) -> c(foo);
+            }
+        }
+    """)
+
+    state = State([
+        Proposition.parse("a(foo)"),
+        Proposition.parse("b(foo)"),
+        Proposition.parse("c(foo)"),
+    ])
+
+    chains = list(chain(state, max_depth=3, max_breadth=1, backward=True, logic=logic))
+    assert len(chains) == 3
+
+    chains = list(chain(state, max_depth=3, max_breadth=2, backward=True, logic=logic))
+    assert len(chains) == 4

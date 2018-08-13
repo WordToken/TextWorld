@@ -296,3 +296,211 @@ def print_chains(chains, verbose=False, backward=False):
         print("\n{}.\t{}".format(i + 1, c[0].action))
         for node in c[1:]:
             print("\t{}".format(node.action))
+
+
+from typing import Collection, Iterable, Mapping, Optional
+
+from textworld.generator.data import get_logic
+from textworld.generator.game import Quest
+from textworld.logic import GameLogic, Rule, State
+
+
+class _ChainNode:
+    """
+    A node in a chain being generated.
+    """
+
+    def __init__(self, parent, state, action, backtracks, depth, breadth):
+        self.parent = parent
+        self.state = state
+        self.action = action
+        self.backtracks = backtracks
+        self.depth = depth
+        self.breadth = breadth
+
+
+class _Chainer:
+    """
+    Helper class for the chaining implementation.
+    """
+
+    def __init__(self, state, backward, min_depth, max_depth, max_breadth,
+                     create_variables, logic, rules_per_depth):
+        self.state = state
+        self.backward = backward
+        self.min_depth = min_depth
+        self.max_depth = max_depth
+        self.max_breadth = max_breadth
+        self.create_variables = create_variables
+
+        if logic is None:
+            self.logic = get_logic()
+        else:
+            self.logic = logic
+
+        self.rules = self.logic.rules.values()
+        self.constraints = self.logic.constraints.values()
+
+        if rules_per_depth is None:
+            self.rules_per_depth = {}
+        else:
+            self.rules_per_depth = rules_per_depth
+
+    def root(self):
+        return _ChainNode(None, self.state, None, [], 0, 1)
+
+    def children(self, node):
+        if node.depth < self.max_depth:
+            yield from self.chain(node)
+
+        yield from self.backtrack(node)
+
+    def chain(self, node):
+        rules = self.rules_per_depth.get(node.depth, self.rules)
+
+        actions = []
+        states = []
+        for rule, mapping in self.all_assignments(node.state, rules):
+            action = self.try_instantiate(node.state, rule, mapping)
+            if not action:
+                continue
+
+            if not self.is_relevant(node, action):
+                continue
+
+            state = self.apply(node.state, action)
+            if not state:
+                continue
+
+            actions.append(action)
+            states.append(state)
+
+        for i, action in enumerate(actions):
+            remaining = actions[i+1:]
+            backtracks = node.backtracks + [remaining]
+            yield _ChainNode(node, states[i], action, backtracks, node.depth + 1, node.breadth)
+
+    def backtrack(self, node):
+        if node.breadth >= self.max_breadth:
+            return
+
+        for i, actions in enumerate(node.backtracks):
+            backtracks = node.backtracks[:i]
+
+            for j, action in enumerate(actions):
+                state = self.apply(node.state, action)
+                if not state:
+                    continue
+
+                remaining = actions[j+1:]
+                new_backtracks = backtracks + [remaining]
+                yield _ChainNode(node, state, action, new_backtracks, i + 1, node.breadth + 1)
+
+    def is_relevant(self, node, action):
+        if not node.action:
+            return True
+
+        if self.backward:
+            # XXX
+            post = action.removed
+            pre = node.action.postconditions
+        else:
+            post = node.action.added
+            pre = action.preconditions
+
+        return bool(set(post) & set(pre))
+
+    def apply(self, state, action):
+        new_state = state.copy()
+        for prop in action.preconditions:
+            if not new_state.is_fact(prop):
+                if all(state.has_variable(var) for var in prop.arguments):
+                    # Don't allow creating new predicates without any new variables
+                    return None
+                new_state.add_fact(prop)
+
+        # Make sure new_state still respects the constraints
+        if not self.check_state(new_state):
+            return None
+
+        new_state.apply(action)
+
+        # XXX: Some debug checks
+        assert self.check_state(new_state)
+
+        return new_state
+
+    def check_state(self, state):
+        fail = Proposition("fail", [])
+
+        constraints = state.all_applicable_actions(self.constraints)
+        for constraint in constraints:
+            if state.is_applicable(constraint):
+                # Optimistically delay copying the state
+                copy = state.copy()
+                copy.apply(constraint)
+
+                if copy.is_fact(fail):
+                    return False
+
+        return True
+
+    def try_instantiate(self, state, rule, mapping):
+        for ph in rule.placeholders:
+            if mapping.get(ph) is None:
+                # XXX: types_counts, max_types_counts
+                name = get_new(ph.type)
+                mapping[ph] = Variable(name, ph.type)
+
+        return rule.instantiate(mapping)
+
+    def all_assignments(self, state, rules):
+        assignments = []
+        for rule in rules:
+            if self.backward:
+                rule = rule.inverse()
+            # XXX: self.constants_mapping?
+            # XXX: constrained_types
+            #for mapping in state.all_assignments(rule, data.get_types().constants_mapping, self.create_variables):
+            for mapping in state.all_assignments(rule, {}, self.create_variables):
+                assignments.append((rule, mapping))
+
+        # Keep everything in a deterministic order
+        return sorted(assignments, key=_assignment_sort_key)
+
+    def is_complete_chain(self, node):
+        return node.depth >= self.min_depth
+
+    def make_quest(self, node):
+        actions = []
+        parent = node
+        while parent:
+            if parent.action:
+                actions.append(parent.action)
+            parent = parent.parent
+
+        return actions
+
+
+def chain(
+    state: State,
+    backward: bool = False,
+    min_depth: int = 1,
+    max_depth: int = 1,
+    max_breadth: int = 1,
+    create_variables: bool = False,
+    logic: GameLogic = None,
+    rules_per_depth: Mapping[int, Collection[Rule]] = None,
+) -> Iterable[Quest]:
+
+    chainer = _Chainer(state, backward, min_depth, max_depth, max_breadth,
+                           create_variables, logic, rules_per_depth)
+
+    stack = [chainer.root()]
+    while stack:
+        node = stack.pop()
+
+        for child in chainer.children(node):
+            if chainer.is_complete_chain(child):
+                yield chainer.make_quest(child)
+            stack.append(child)
